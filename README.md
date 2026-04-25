@@ -76,8 +76,10 @@ python3 read_motor_registers.py \
   --channel can0 \
   --bustype socketcan \
   --bitrate 500000 \
-  --source-id 0x01 \
-  --arb-id 0x000 \
+  --source-id 0x0A \
+  --tx-base-id 0x600 \
+  --rx-id 0x600 \
+  --cmd 0x01 \
   --timeout 0.2
 ```
 
@@ -91,8 +93,10 @@ python3 read_motor_registers.py \
 - `--channel`：CAN 通道，默认 `can0`
 - `--bustype`：`python-can` 接口类型，默认 `socketcan`
 - `--bitrate`：波特率，默认 `500000`
-- `--source-id`：问者 ID，默认 `0x01`
-- `--arb-id`：发送帧标识符 ID，默认 `0x000`
+- `--source-id`：主站 ID，默认 `0x0A`
+- `--tx-base-id`：发送 CAN ID 基值，默认 `0x600`（最终发送 ID = 基值 + 电机 ID）
+- `--rx-id`：接收应答 CAN ID，默认 `0x600`
+- `--cmd`：读取命令字节，默认 `0x01`
 - `--timeout`：每个寄存器等待应答超时（秒），默认 `0.2`
 
 ---
@@ -104,3 +108,20 @@ python3 read_motor_registers.py --ids motor_ids.json --addrs register_addrs.json
 ```
 
 如果你只想先确认 JSON 配置是否正确，先用默认模式（不加 `--read`）即可。
+
+
+## 6) 协议示例（按你提供的帧）
+
+例如读取电机 `id=11 (0x0B)`、寄存器 `0x170`：
+
+- 发送：`can id = 0x60B`，数据：`00 0A 01 70`
+- 接收：`can id = 0x600`，数据：`00 0B 01 70 AA AA`
+
+其中 `AA AA` 为寄存器 16 位值（低字节在前），即：`value = data[4] | (data[5] << 8)`。
+
+脚本默认参数已经按这个规则设置：
+
+- `--tx-base-id 0x600`（发送 ID = 基值 + 电机ID）
+- `--rx-id 0x600`（应答固定 ID）
+- `--source-id 0x0A`
+- `--cmd 0x01`

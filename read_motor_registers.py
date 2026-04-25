@@ -10,13 +10,16 @@ from typing import Dict, Iterable, List, Optional
 
 try:
     import can  # type: ignore
-except ImportError:  # 允许仅演示 JSON 与报文组包逻辑
+except ImportError:
     can = None
 
-MODE_BYTE = 0x01
-CMD_READ_16_REQ = 0x14  # 问者功能码 20 (0x14)
-CMD_READ_16_ACK = 0x15  # 答者正常功能码 21 (0x15)
-CMD_READ_16_ERR = 0x16  # 答者异常功能码 22 (0x16)
+# 依据用户给出的示例：
+# 读 id=11 电机时，请求 can id = 0x60B，回复 can id = 0x600
+# 请求数据: 00 0A 01 70
+# 回复数据: 00 0B 01 70 AA AA  (AA AA 为16位寄存器值)
+TX_ID_BASE = 0x600
+RX_ID = 0x600
+READ_CMD = 0x01
 
 
 def load_id_list(path: Path) -> List[int]:
@@ -33,79 +36,74 @@ def load_addr_list(path: Path) -> List[int]:
 
     out: List[int] = []
     for raw in data["addr"]:
-        if isinstance(raw, str):
-            out.append(int(raw, 0))
-        else:
-            out.append(int(raw))
+        out.append(int(raw, 0) if isinstance(raw, str) else int(raw))
     return out
 
 
-def build_read_request(target_id: int, reg_addr: int, source_id: int = 0x01) -> List[int]:
-    """构造读取 16 位寄存器请求 DATA[0..7]。"""
+def build_read_request(target_id: int, reg_addr: int, source_id: int = 0x0A, cmd: int = READ_CMD) -> List[int]:
+    """构造读取 16 位寄存器请求 DATA。格式: [0x00, source_id, cmd, addr_low]"""
+    _ = target_id
     return [
-        source_id & 0xFF,          # Byte0: 问者 ID（消息源）
-        CMD_READ_16_REQ & 0xFF,    # Byte1: 功能码 0x14
-        reg_addr & 0xFF,           # Byte2: 寄存器地址低字节
-        (reg_addr >> 8) & 0xFF,    # Byte3: 寄存器地址高字节
         0x00,
-        0x00,
-        0x00,
-        0x00,
+        source_id & 0xFF,
+        cmd & 0xFF,
+        reg_addr & 0xFF,
     ]
 
 
 def parse_read_response(data: Iterable[int]) -> Dict[str, int]:
-    """解析应答帧 DATA，返回功能码、地址和值/错误码。"""
+    """解析应答 DATA。期望格式: [0x00, motor_id, cmd, addr_low, value_lo, value_hi]。"""
     b = list(data)
     if len(b) < 6:
         raise ValueError(f"应答长度过短: {len(b)}")
 
-    cmd = b[1]
-    reg_addr = b[2] | (b[3] << 8)
+    motor_id = b[1]
+    cmd = b[2]
+    addr_low = b[3]
+    reg_val = b[4] | (b[5] << 8)
 
-    if cmd == CMD_READ_16_ACK:
-        reg_val = b[4] | (b[5] << 8)
-        return {"cmd": cmd, "addr": reg_addr, "value": reg_val}
-    if cmd == CMD_READ_16_ERR:
-        err_code = b[4]
-        return {"cmd": cmd, "addr": reg_addr, "error": err_code}
-
-    return {"cmd": cmd, "addr": reg_addr}
+    return {
+        "motor_id": motor_id,
+        "cmd": cmd,
+        "addr_low": addr_low,
+        "value": reg_val,
+    }
 
 
 def can_read_register(
     bus: "can.BusABC",
     motor_id: int,
     reg_addr: int,
-    source_id: int = 0x01,
-    arbitration_id: int = 0x000,
+    source_id: int = 0x0A,
+    tx_base_id: int = TX_ID_BASE,
+    rx_id: int = RX_ID,
+    cmd: int = READ_CMD,
     timeout: float = 0.2,
 ) -> Optional[Dict[str, int]]:
-    """发请求并等待应答。注意：ID 过滤规则按你的控制器再调整。"""
-    request_data = build_read_request(motor_id, reg_addr, source_id)
-    tx = can.Message(arbitration_id=arbitration_id, is_extended_id=False, data=request_data)
+    """发送单次读寄存器请求并等待应答。"""
+    request_data = build_read_request(motor_id, reg_addr, source_id=source_id, cmd=cmd)
+    tx = can.Message(arbitration_id=(tx_base_id + (motor_id & 0xFF)), is_extended_id=False, data=request_data)
     bus.send(tx)
 
-    deadline = timeout
     while True:
-        rx = bus.recv(timeout=deadline)
+        rx = bus.recv(timeout=timeout)
         if rx is None:
             return None
 
-        if len(rx.data) < 2:
-            continue
-
-        # 协议中 D7-D0 通常放答者ID，这里假设在 arbitration_id 的低8位
-        responder_id = rx.arbitration_id & 0xFF
-        if responder_id != (motor_id & 0xFF):
+        if rx.arbitration_id != rx_id:
             continue
 
         parsed = parse_read_response(rx.data)
+        if parsed["motor_id"] != (motor_id & 0xFF):
+            continue
+        if parsed["cmd"] != (cmd & 0xFF):
+            continue
+        if parsed["addr_low"] != (reg_addr & 0xFF):
+            continue
         return parsed
 
 
 def run_print_only(ids: List[int], addrs: List[int]) -> None:
-    """仅按电机打印要读取的寄存器列表。"""
     for mid in ids:
         print(f"电机 ID {mid}:")
         for addr in addrs:
@@ -119,7 +117,9 @@ def run_can_read(
     bustype: str,
     bitrate: int,
     source_id: int,
-    arbitration_id: int,
+    tx_base_id: int,
+    rx_id: int,
+    cmd: int,
     timeout: float,
 ) -> None:
     if can is None:
@@ -134,33 +134,31 @@ def run_can_read(
                     motor_id=mid,
                     reg_addr=addr,
                     source_id=source_id,
-                    arbitration_id=arbitration_id,
+                    tx_base_id=tx_base_id,
+                    rx_id=rx_id,
+                    cmd=cmd,
                     timeout=timeout,
                 )
                 if result is None:
                     print(f"  - 0x{addr:04X}: 超时无应答")
                     continue
 
-                cmd = result.get("cmd")
-                if cmd == CMD_READ_16_ACK:
-                    print(f"  - 0x{addr:04X}: 0x{result['value']:04X} ({result['value']})")
-                elif cmd == CMD_READ_16_ERR:
-                    print(f"  - 0x{addr:04X}: 错误码 {result['error']}")
-                else:
-                    print(f"  - 0x{addr:04X}: 未知应答 {result}")
+                print(f"  - 0x{addr:04X}: 0x{result['value']:04X} ({result['value']})")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="按 JSON 列表读取电机 16 位寄存器")
-    parser.add_argument("--ids", required=True, type=Path, help="电机ID列表JSON，如 {'id':[1,2,3]}")
+    parser.add_argument("--ids", required=True, type=Path, help="电机ID列表JSON，如 {'id':[11,12]}")
     parser.add_argument("--addrs", required=True, type=Path, help="寄存器地址JSON，如 {'addr':['0x170','0x171']}")
 
     parser.add_argument("--read", action="store_true", help="启用真实 CAN 读取；默认仅打印分组")
     parser.add_argument("--channel", default="can0", help="CAN 通道，默认 can0")
     parser.add_argument("--bustype", default="socketcan", help="python-can interface，默认 socketcan")
     parser.add_argument("--bitrate", default=500000, type=int, help="波特率，默认 500000")
-    parser.add_argument("--source-id", default=0x01, type=lambda x: int(x, 0), help="问者ID，默认 0x01")
-    parser.add_argument("--arb-id", default=0x000, type=lambda x: int(x, 0), help="发送帧标识符ID，默认 0x000")
+    parser.add_argument("--source-id", default=0x0A, type=lambda x: int(x, 0), help="主站ID，默认 0x0A")
+    parser.add_argument("--tx-base-id", default=0x600, type=lambda x: int(x, 0), help="发送 CAN ID 基值，默认 0x600")
+    parser.add_argument("--rx-id", default=0x600, type=lambda x: int(x, 0), help="接收应答 CAN ID，默认 0x600")
+    parser.add_argument("--cmd", default=0x01, type=lambda x: int(x, 0), help="读取命令字节，默认 0x01")
     parser.add_argument("--timeout", default=0.2, type=float, help="每个寄存器应答超时秒")
 
     args = parser.parse_args()
@@ -176,7 +174,9 @@ def main() -> None:
             bustype=args.bustype,
             bitrate=args.bitrate,
             source_id=args.source_id,
-            arbitration_id=args.arb_id,
+            tx_base_id=args.tx_base_id,
+            rx_id=args.rx_id,
+            cmd=args.cmd,
             timeout=args.timeout,
         )
     else:

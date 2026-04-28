@@ -18,8 +18,9 @@ except ImportError:
 # 应答: can0 700 [6] 0B 0C 01 70 00 02
 TX_ID_BASE = 0x100           # 发送ID = 0x100 + motor_id
 RX_ID_FIXED = 0x700          # 应答ID固定
-MASTER_ID = 0x14             # 请求 Byte1 固定
-READ_CMD = 0x01              # 请求/应答 Byte2 固定
+MASTER_ID = 0x1E             # 请求 Byte1 固定
+READ_CMD = 0x00              # 请求/应答 Byte2 固定
+w_data = 500              # 请求/应答 Byte2 固定
 
 
 def load_id_list(path: Path) -> List[int]:
@@ -29,20 +30,10 @@ def load_id_list(path: Path) -> List[int]:
     return [int(v) for v in data["id"]]
 
 
-def load_addr_list(path: Path) -> List[int]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if "addr" not in data or not isinstance(data["addr"], list):
-        raise ValueError(f"{path} 缺少 addr 列表，例如 {{\"addr\":[\"0x170\",\"0x171\"]}}")
-
-    out: List[int] = []
-    for raw in data["addr"]:
-        out.append(int(raw, 0) if isinstance(raw, str) else int(raw))
-    return out
-
 
 def build_read_request(reg_addr: int) -> List[int]:
     """请求数据固定为: [00, 0A, 01, addr_low]。"""
-    return [0x00, MASTER_ID, (reg_addr >> 8) & 0xFF, reg_addr & 0xFF,]
+    return [0x00, MASTER_ID, (reg_addr >> 8) & 0xFF, reg_addr & 0xFF, (w_data >> 8) & 0xFF, w_data & 0xFF]
 
 
 def parse_read_response(data: Iterable[int]) -> Dict[str, int]:
@@ -77,34 +68,7 @@ def can_read_register(
     tx_data = build_read_request(reg_addr)
     tx = can.Message(arbitration_id=tx_id, is_extended_id=False, data=tx_data)
     bus.send(tx)
-
-    while True:
-        rx = bus.recv(timeout=timeout)
-        if rx is None:
-            return None
-
-        if rx.arbitration_id != RX_ID_FIXED:
-            continue
-
-        parsed = parse_read_response(rx.data)
-        if parsed["motor_id"] != (motor_id & 0xFF):
-            continue
-        if parsed["host_id"] != (reg_addr >> 8) & 0xFF:
-            continue
-        if parsed["cmd"] != 0x15:
-            continue
-        if parsed["addr_low"] != (reg_addr & 0xFF):
-            continue
-        return parsed
-
-
-def run_print_only(ids: List[int], addrs: List[int]) -> None:
-    for mid in ids:
-        print(f"电机 ID {mid}:")
-        for addr in addrs:
-            tx_id = TX_ID_BASE + (mid & 0xFF)
-            tx_data = build_read_request(addr)
-            print(f"  - 读 0x{addr:04X}: 发送 can0 {tx_id:03X} [4] {' '.join(f'{x:02X}' for x in tx_data)}")
+    return None
 
 
 def run_can_read(
@@ -128,7 +92,6 @@ def run_can_read(
                     continue
                 print(f"  - 0x{addr:04X}: 0x{result['value']:04X} ({result['value']})")
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="按 JSON 列表读取电机 16 位寄存器")
     parser.add_argument("--ids", required=True, type=Path, help="电机ID列表JSON，如 {'id':[11,12]}")
@@ -143,20 +106,17 @@ def main() -> None:
     args = parser.parse_args()
 
     ids = load_id_list(args.ids)
-    addrs = load_addr_list(args.addrs)
 
-    if args.read:
-        run_can_read(
-            ids=ids,
-            addrs=addrs,
-            channel=args.channel,
-            bustype=args.bustype,
-            bitrate=args.bitrate,
-            timeout=args.timeout,
-        )
-    else:
-        run_print_only(ids, addrs)
+    addrs = [0x00dd]
 
+    run_can_read(
+        ids=ids,
+        addrs=addrs,
+        channel=args.channel,
+        bustype=args.bustype,
+        bitrate=args.bitrate,
+        timeout=args.timeout,
+    )
 
 if __name__ == "__main__":
     main()
